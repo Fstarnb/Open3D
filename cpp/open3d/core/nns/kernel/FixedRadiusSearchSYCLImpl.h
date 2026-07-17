@@ -19,9 +19,12 @@
 ///   own cell or one of the 7 cells toward the corner nearest the query
 ///   position offset by +-radius per axis (8 bins total, deduplicated).
 /// - \ref BuildSpatialHashTableSYCL builds the grid once per dataset: count
-///   points per cell, turn counts into CSR offsets via a device inclusive
-///   scan (oneDPL, replacing CUDA's cub::DeviceScan::InclusiveSum), then
-///   scatter point indices into their cell's slot range.
+///   points per cell (per batch), turn counts into CSR offsets via a single
+///   device inclusive scan over all batches at once (oneDPL, replacing
+///   CUDA's single cub::DeviceScan::InclusiveSum call), then scatter point
+///   indices into their cell's slot range (per batch, reusing one counter
+///   buffer). All kernels are enqueued on one in-order queue with only one
+///   host wait per pass -- no wait_and_throw inside the per-batch loops.
 /// - \ref CountNeighborsSYCL / \ref WriteNeighborsSYCL implement the
 ///   fixed-radius two-pass search (count, then gather) used by
 ///   FixedRadiusSearchSYCL in KnnSearchOpsSYCL.cpp.
@@ -33,8 +36,9 @@
 ///   cub::DeviceSegmentedRadixSort::SortPairs). Like CUDA, ties are not
 ///   secondarily ordered by index.
 ///
-/// Only the L2 metric is supported (checked by the caller), matching the
-/// rest of the SYCL NNS backend.
+/// Fixed-radius / hybrid grid search supports L1, L2, and Linf (same semantics
+/// as FixedRadiusSearchImpl.cuh). L2 compares squared distances to radius²;
+/// L1 and Linf compare the metric distance to radius.
 
 #pragma once
 
@@ -53,7 +57,7 @@ namespace open3d {
 namespace core {
 namespace nns {
 
-namespace frs_detail {
+namespace {
 
 /// Squared L2 distance between two 3D points.
 template <class T>
@@ -61,6 +65,47 @@ inline T SquaredDistance(const utility::MiniVec<T, 3>& a,
                          const utility::MiniVec<T, 3>& b) {
     utility::MiniVec<T, 3> d = a - b;
     return d.dot(d);
+}
+
+/// Distance under \p metric (L2 returns squared distance, matching CUDA).
+template <class T>
+inline T DistanceForMetric(Metric metric,
+                           const utility::MiniVec<T, 3>& p,
+                           const utility::MiniVec<T, 3>& q) {
+    if (metric == Linf) {
+        utility::MiniVec<T, 3> d = (p - q).abs();
+        T m = d[0];
+        if (d[1] > m) m = d[1];
+        if (d[2] > m) m = d[2];
+        return m;
+    }
+    if (metric == L1) {
+        utility::MiniVec<T, 3> d = (p - q).abs();
+        return d[0] + d[1] + d[2];
+    }
+    return SquaredDistance(p, q);
+}
+
+/// True if \p p is a neighbor of \p q under \p metric and \p threshold.
+template <class T>
+inline bool IsNeighbor(Metric metric,
+                        const utility::MiniVec<T, 3>& p,
+                        const utility::MiniVec<T, 3>& q,
+                        T threshold) {
+    return DistanceForMetric(metric, p, q) <= threshold;
+}
+
+template <class T>
+inline bool IsNeighbor(Metric metric,
+                        const utility::MiniVec<T, 3>& p,
+                        const utility::MiniVec<T, 3>& q,
+                        T threshold,
+                        T* out_dist) {
+    const T dist = DistanceForMetric(metric, p, q);
+    if (out_dist) {
+        *out_dist = dist;
+    }
+    return dist <= threshold;
 }
 
 /// Collects the (up to 8, deduplicated) hash bins that may contain a
@@ -100,7 +145,13 @@ inline void CollectBinsToVisit(const utility::MiniVec<T, 3>& pos,
     }
 }
 
-}  // namespace frs_detail
+template <class T>
+struct SortKey {
+    int64_t query_id;
+    T dist;
+};
+
+}  // namespace
 
 /// Builds a uniform spatial-hash grid ("cell list") for a fixed-radius
 /// search: count points per cell -> device inclusive scan -> scatter point
@@ -155,23 +206,40 @@ void BuildSpatialHashTableSYCLRaw(sycl::queue& queue,
     }
     queue.wait_and_throw();
 
-    // Pass 2: turn per-cell counts into CSR start offsets (device inclusive
-    // scan; replaces cub::DeviceScan::InclusiveSum).
-    for (int b = 0; b < batch_size; ++b) {
-        const uint32_t first_cell_idx = host_hash_table_splits[b];
-        const uint32_t hash_table_size =
-                host_hash_table_splits[b + 1] - first_cell_idx;
-        uint32_t* cell_splits_i = cell_splits_ptr + first_cell_idx;
-        std::inclusive_scan(policy, cell_splits_i,
-                            cell_splits_i + hash_table_size + 1, cell_splits_i);
+    // Pass 2: turn per-cell counts into CSR start offsets with a *single*
+    // scan over the whole (all-batches-concatenated) array -- mirrors CUDA,
+    // which calls cub::DeviceScan::InclusiveSum once over the full
+    // count_tmp/hash_table_cell_splits buffer rather than once per batch.
+    // This is valid (not just faster) because per-batch segments are laid
+    // out back-to-back and each segment's raw count at its own first slot is
+    // always 0 (see the "hash + 1" count in Pass 1): the running sum thus
+    // carries the *previous* batches' total point counts straight into the
+    // next batch's segment, which is exactly the absolute base offset that
+    // batch needs into the shared hash_table_index array. A segmented scan
+    // would compute the same per-batch-relative values and gain nothing.
+    if (cell_splits_size > 0) {
+        std::inclusive_scan(policy, cell_splits_ptr,
+                            cell_splits_ptr + cell_splits_size, cell_splits_ptr);
     }
     queue.wait_and_throw();
 
-    // Pass 3: scatter point indices into their cell's slot range. A fresh
-    // per-batch slot counter (reset to 0) plays the role of CUDA's count_tmp,
-    // so concurrent writers to the same cell get distinct slots.
-    // Uses sycl::malloc_device for the scratch buffer to avoid allocator
-    // dependencies (no Open3D Tensor or PyTorch tensor needed here).
+    // Pass 3: scatter point indices into their cell's slot range. A single
+    // reused slot-counter buffer (memset to 0 per batch on this in-order
+    // queue, one wait at the end) plays the role of CUDA's count_tmp. One
+    // sycl::malloc_device sized to the largest batch hash table keeps this
+    // path free of Open3D Tensor allocation (PyTorch Raw dispatch).
+    uint32_t max_hash_table_size = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        max_hash_table_size = std::max<uint32_t>(
+                max_hash_table_size,
+                host_hash_table_splits[b + 1] - host_hash_table_splits[b]);
+    }
+    uint32_t* slot_counts_ptr = nullptr;
+    if (max_hash_table_size > 0) {
+        slot_counts_ptr =
+                sycl::malloc_device<uint32_t>(max_hash_table_size, queue);
+    }
+
     for (int b = 0; b < batch_size; ++b) {
         const int64_t point_begin = host_points_row_splits[b];
         const int64_t point_end = host_points_row_splits[b + 1];
@@ -182,9 +250,13 @@ void BuildSpatialHashTableSYCLRaw(sycl::queue& queue,
                 host_hash_table_splits[b + 1] - first_cell_idx;
         const uint32_t* cell_splits_i = cell_splits_ptr + first_cell_idx;
 
-        uint32_t* slot_counts =
-                sycl::malloc_device<uint32_t>(hash_table_size, queue);
-        queue.fill(slot_counts, uint32_t(0), hash_table_size).wait();
+        // Queue is in-order (see SYCLContext), so this memset is guaranteed
+        // to complete before the parallel_for below reads/writes
+        // slot_counts_ptr, and this batch's parallel_for is guaranteed to
+        // complete before the next batch's memset -- without any explicit
+        // host-side wait between batches.
+        queue.memset(slot_counts_ptr, 0,
+                     static_cast<size_t>(hash_table_size) * sizeof(uint32_t));
 
         queue.parallel_for(
                 sycl::range<1>(num_points_i),
@@ -196,13 +268,15 @@ void BuildSpatialHashTableSYCLRaw(sycl::queue& queue,
                             SpatialHash(voxel_index) % hash_table_size;
                     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
                                      sycl::memory_scope::device>
-                            cnt(slot_counts[hash]);
+                            cnt(slot_counts_ptr[hash]);
                     const uint32_t slot = cnt.fetch_add(1);
                     index_ptr[cell_splits_i[hash] + slot] =
                             static_cast<uint32_t>(i);
                 });
-        queue.wait_and_throw();
-        sycl::free(slot_counts, queue);
+    }
+    queue.wait_and_throw();
+    if (slot_counts_ptr != nullptr) {
+        sycl::free(slot_counts_ptr, queue);
     }
 }
 
@@ -253,6 +327,8 @@ void CountNeighborsSYCL(sycl::queue& queue,
                         const T* const points,
                         T inv_voxel_size,
                         T radius,
+                        Metric metric,
+                        bool ignore_query_point,
                         T threshold) {
     if (num_queries == 0) return;
     queue.parallel_for(
@@ -261,8 +337,8 @@ void CountNeighborsSYCL(sycl::queue& queue,
                 const int64_t q = id[0];
                 utility::MiniVec<T, 3> query_pos(query_points + 3 * q);
                 int bins[8];
-                frs_detail::CollectBinsToVisit(query_pos, inv_voxel_size,
-                                               radius, hash_table_size, bins);
+                CollectBinsToVisit(query_pos, inv_voxel_size, radius,
+                                   hash_table_size, bins);
                 uint32_t count = 0;
                 for (int bi = 0; bi < 8; ++bi) {
                     const int bin = bins[bi];
@@ -272,8 +348,10 @@ void CountNeighborsSYCL(sycl::queue& queue,
                     for (uint32_t j = begin; j < end; ++j) {
                         const uint32_t idx = point_index_table[j];
                         utility::MiniVec<T, 3> p(points + 3 * idx);
-                        if (frs_detail::SquaredDistance(p, query_pos) <=
-                            threshold)
+                        if (ignore_query_point && (query_pos == p).all()) {
+                            continue;
+                        }
+                        if (IsNeighbor(metric, p, query_pos, threshold))
                             ++count;
                     }
                 }
@@ -299,6 +377,8 @@ void WriteNeighborsSYCL(sycl::queue& queue,
                         const T* const points,
                         T inv_voxel_size,
                         T radius,
+                        Metric metric,
+                        bool ignore_query_point,
                         T threshold,
                         bool return_distances) {
     if (num_queries == 0) return;
@@ -308,8 +388,8 @@ void WriteNeighborsSYCL(sycl::queue& queue,
                 const int64_t q = id[0];
                 utility::MiniVec<T, 3> query_pos(query_points + 3 * q);
                 int bins[8];
-                frs_detail::CollectBinsToVisit(query_pos, inv_voxel_size,
-                                               radius, hash_table_size, bins);
+                CollectBinsToVisit(query_pos, inv_voxel_size, radius,
+                                   hash_table_size, bins);
                 const int64_t offset = neighbors_row_splits[q];
                 int64_t count = 0;
                 for (int bi = 0; bi < 8; ++bi) {
@@ -320,9 +400,12 @@ void WriteNeighborsSYCL(sycl::queue& queue,
                     for (uint32_t j = begin; j < end; ++j) {
                         const uint32_t idx = point_index_table[j];
                         utility::MiniVec<T, 3> p(points + 3 * idx);
-                        const T dist =
-                                frs_detail::SquaredDistance(p, query_pos);
-                        if (dist <= threshold) {
+                        if (ignore_query_point && (query_pos == p).all()) {
+                            continue;
+                        }
+                        T dist;
+                        if (IsNeighbor(metric, p, query_pos, threshold,
+                                       &dist)) {
                             indices[offset + count] = static_cast<TIndex>(idx);
                             if (return_distances) {
                                 distances[offset + count] = dist;
@@ -362,8 +445,8 @@ void WriteNeighborsHybridSYCL(sycl::queue& queue,
                 const int64_t q = id[0];
                 utility::MiniVec<T, 3> query_pos(query_points + 3 * q);
                 int bins[8];
-                frs_detail::CollectBinsToVisit(query_pos, inv_voxel_size,
-                                               radius, hash_table_size, bins);
+                CollectBinsToVisit(query_pos, inv_voxel_size, radius,
+                                   hash_table_size, bins);
 
                 const int64_t offset = int64_t(max_knn) * q;
                 int count = 0;
@@ -378,8 +461,7 @@ void WriteNeighborsHybridSYCL(sycl::queue& queue,
                     for (uint32_t j = begin; j < end; ++j) {
                         const uint32_t idx = point_index_table[j];
                         utility::MiniVec<T, 3> p(points + 3 * idx);
-                        const T dist =
-                                frs_detail::SquaredDistance(p, query_pos);
+                        const T dist = SquaredDistance(p, query_pos);
                         if (dist > threshold) continue;
 
                         if (count < max_knn) {
@@ -499,21 +581,17 @@ void SortNeighborsByDistanceSYCL(const Device& device,
                 });
         queue.wait_and_throw();
     } else {
-        struct SortKey {
-            int64_t query_id;
-            T dist;
-        };
-        SortKey* keys = sycl::malloc_device<SortKey>(num_indices, queue);
+        using KeyT = SortKey<T>;
+        KeyT* keys = sycl::malloc_device<KeyT>(num_indices, queue);
         queue.parallel_for(sycl::range<1>(num_indices),
                            [=](sycl::id<1> id) [[intel::kernel_args_restrict]] {
                                const int64_t i = id[0];
-                               keys[i] = SortKey{query_id_ptr[i],
-                                                 distances_ptr[i]};
+                               keys[i] = KeyT{query_id_ptr[i], distances_ptr[i]};
                            });
         queue.wait_and_throw();
 
         oneapi::dpl::sort_by_key(policy, keys, keys + num_indices, values_ptr,
-                                 [](const SortKey& a, const SortKey& b) {
+                                 [](const KeyT& a, const KeyT& b) {
                                      if (a.query_id != b.query_id)
                                          return a.query_id < b.query_id;
                                      return a.dist < b.dist;
