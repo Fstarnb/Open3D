@@ -857,7 +857,8 @@ void SelectTopKQueriesHeap(sycl::queue& queue,
 
 }  // namespace
 
-/// K-bucket dispatch to \ref SelectTopKQueriesHeap (file-local, anonymous namespace).
+/// K-bucket dispatch to \ref SelectTopKQueriesHeap (file-local, anonymous
+/// namespace).
 template <typename T, typename TIndex>
 void DispatchSelectTopKQueries(sycl::queue& queue,
                                const T* distances_ptr,
